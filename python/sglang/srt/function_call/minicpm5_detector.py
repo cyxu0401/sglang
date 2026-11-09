@@ -28,22 +28,51 @@ except Exception:  # pragma: no cover - environment may not have lxml
 _FUNC_NAME_V1_REGEX = re.compile(r"<function\s+name=[\'\"]([^\'\"]+)[\'\"][^>]*>")
 # A quoted name can contain >, while < starts another tag.
 _PARAM_OPEN_PATTERN = r"""<param(?=\s|/?>)((?:[^<>"']|"[^<"]*"|'[^<']*')*)>"""
-_PARAM_OPEN_REGEX = re.compile(_PARAM_OPEN_PATTERN)
+_XML_SECTION_PATTERN = r"<!--|<!\[CDATA\[|<\?"
+_PARAM_OPEN_OR_SECTION_REGEX = re.compile(
+    rf"{_XML_SECTION_PATTERN}|{_PARAM_OPEN_PATTERN}"
+)
 _PARAM_NAME_REGEX = re.compile(r"\s+name=(['\"])([^'\"]+)\1", re.DOTALL)
 _PARAM_NAME_ATTRIBUTE_REGEX = re.compile(r"\bname=")
 _PARAM_VALUE_MARKER_REGEX = re.compile(
-    rf"<!\[CDATA\[|</param>|{_PARAM_OPEN_PATTERN}|</function>"
+    rf"{_XML_SECTION_PATTERN}|</param>|{_PARAM_OPEN_PATTERN}|</function>"
 )
 _ARGUMENTS_OPEN_REGEX = re.compile(r"\s*<arguments\s*>")
 _ARGUMENTS_CLOSE_REGEX = re.compile(r"</arguments\s*>\s*$")
+_FUNCTION_CLOSE = "</function>"
+_FUNCTION_BOUNDARY_REGEX = re.compile(rf"{_XML_SECTION_PATTERN}|{_FUNCTION_CLOSE}")
+_XML_SECTION_END = {"<!--": "-->", "<![CDATA[": "]]>", "<?": "?>"}
+
+
+def _find_section_end(text: str, marker: re.Match[str]) -> int:
+    terminator = _XML_SECTION_END[marker.group()]
+    end = text.find(terminator, marker.end())
+    return end + len(terminator) if end != -1 else -1
+
+
+def _find_function_end(text: str, start: int) -> tuple[int, int]:
+    """Return the block end and where to resume scanning after another chunk."""
+    while marker := _FUNCTION_BOUNDARY_REGEX.search(text, start):
+        if marker.group() == _FUNCTION_CLOSE:
+            return marker.end(), marker.end()
+        start = _find_section_end(text=text, marker=marker)
+        if start == -1:
+            return -1, marker.start()
+    # Keep enough overlap to match a marker split across two chunks.
+    return -1, max(start, len(text) - len(_FUNCTION_CLOSE) + 1)
 
 
 def _iter_fallback_params(block: str, body_start: int):
     """Recover malformed parameter markup while preserving literal CDATA content."""
     pos = body_start
     has_arguments_wrapper = _ARGUMENTS_OPEN_REGEX.match(block, body_start) is not None
-    last_cdata_end = block.rfind("]]>")
-    while match := _PARAM_OPEN_REGEX.search(block, pos):
+    while match := _PARAM_OPEN_OR_SECTION_REGEX.search(block, pos):
+        if match.group() in _XML_SECTION_END:
+            pos = _find_section_end(text=block, marker=match)
+            if pos == -1:
+                raise ValueError("Unterminated XML section before a parameter")
+            continue
+
         # Fallback accepts name-only tags; the XML parser handles other attributes.
         name = _PARAM_NAME_REGEX.fullmatch(match.group(1))
         key = name.group(2).strip() if name else None
@@ -52,15 +81,14 @@ def _iter_fallback_params(block: str, body_start: int):
         while marker := _PARAM_VALUE_MARKER_REGEX.search(block, start):
             marker_text = marker.group()
             parts.append(block[start : marker.start()])
-            if marker_text == "<![CDATA[":
-                start = marker.end()
-                # Avoid rescanning the suffix for each unclosed CDATA opener.
-                if start <= last_cdata_end:
-                    cdata_end = block.find("]]>", start)
-                    parts.append(block[start:cdata_end])
-                    start = cdata_end + len("]]>")
-                elif len(parts) > 1 or parts[0].strip():
-                    parts.append(marker_text)
+            if marker_text in _XML_SECTION_END:
+                start = _find_section_end(text=block, marker=marker)
+                if start == -1:
+                    raise ValueError("Unterminated XML section in a parameter")
+                if marker_text == "<![CDATA[":
+                    parts.append(block[marker.end() : start - len("]]>")])
+                else:
+                    parts.append(block[marker.start() : start])
                 continue
             if marker_text == "</function>" and has_arguments_wrapper:
                 # A missing final parameter close may leave the wrapper close
@@ -112,8 +140,8 @@ class MiniCPM5Detector(BaseFormatDetector):
     def __init__(self):
         super().__init__()
         self.bot_token = "<function"
-        self.eot_token = "</function>"
-        self.func_call_regex = r"<function.*?</function>"
+        self.eot_token = _FUNCTION_CLOSE
+        self._function_scan_pos = len(self.bot_token)
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a MiniCPM-4 V3 XML-styled tool call."""
@@ -141,11 +169,16 @@ class MiniCPM5Detector(BaseFormatDetector):
 
         try:
             last_end = 0
-            for m in re.finditer(self.func_call_regex, text, re.DOTALL):
-                if m.start() > last_end:
-                    normal_parts.append(text[last_end : m.start()])
+            while (start := text.find(self.bot_token, last_end)) != -1:
+                end, _ = _find_function_end(
+                    text=text, start=start + len(self.bot_token)
+                )
+                if end == -1:
+                    break
+                if start > last_end:
+                    normal_parts.append(text[last_end:start])
 
-                block = m.group(0)
+                block = text[start:end]
                 func_name = None
                 arguments = {}
                 parsed_ok = False
@@ -219,7 +252,7 @@ class MiniCPM5Detector(BaseFormatDetector):
                 if not parsed_ok:
                     # Fallback path: regex extraction
                     try:
-                        m_fn = _FUNC_NAME_V1_REGEX.search(block)
+                        m_fn = _FUNC_NAME_V1_REGEX.match(block)
                         if m_fn:
                             func_name = (m_fn.group(1) or "").strip()
                         has_invalid_param = False
@@ -269,7 +302,7 @@ class MiniCPM5Detector(BaseFormatDetector):
                 else:
                     normal_parts.append(block)
 
-                last_end = m.end()
+                last_end = end
 
             if last_end < len(text):
                 normal_parts.append(text[last_end:])
@@ -327,13 +360,16 @@ class MiniCPM5Detector(BaseFormatDetector):
                 normal_parts.append(current_text[:start])
                 current_text = current_text[start:]
 
-            end = current_text.find(self.eot_token)
+            end, self._function_scan_pos = _find_function_end(
+                text=current_text, start=self._function_scan_pos
+            )
             if end == -1:
                 self._buffer = current_text
                 break
 
-            block = current_text[: end + len(self.eot_token)]
-            self._buffer = current_text[end + len(self.eot_token) :]
+            block = current_text[:end]
+            self._buffer = current_text[end:]
+            self._function_scan_pos = len(self.bot_token)
 
             result = self.detect_and_parse(block, tools=tools)
             for call in result.calls:

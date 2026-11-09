@@ -293,12 +293,6 @@ def test_unescaped_ampersand_in_parameter_is_preserved():
             {"city": "Shanghai"},
             id="missing-close-in-arguments-wrapper",
         ),
-        pytest.param(
-            '<param name="city"><![CDATA[A & B</param>'
-            '<param name="date">2024-06-27</param>',
-            {"city": "A & B", "date": "2024-06-27"},
-            id="unterminated-cdata",
-        ),
     ],
 )
 def test_malformed_parameter_boundaries_recover_with_complete_function(body, expected):
@@ -317,6 +311,107 @@ def test_malformed_parameter_boundaries_recover_with_complete_function(body, exp
         second = detector.parse_streaming_increment(text[split:], tools)
         assert len(second.calls) == 1, split
         assert json.loads(second.calls[0].parameters) == expected, split
+
+
+@pytest.mark.parametrize("use_fallback", [False, True], ids=["xml", "fallback"])
+def test_function_end_inside_cdata_preserves_command(use_fallback):
+    """A literal function end inside CDATA must not trigger a partial call."""
+    tools = [
+        Tool(
+            function=Function(
+                name="run_command",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string"},
+                        "note": {"type": "string"},
+                    },
+                    "required": ["command"],
+                },
+            )
+        )
+    ]
+    command = 'printf "</function>" > /tmp/marker'
+    text = (
+        '<function name="run_command">'
+        f'<param name="command"><![CDATA[{command}]]></param>'
+    )
+    expected = {"command": command}
+    if use_fallback:
+        text += '<param name="note">A & B</param>'
+        expected["note"] = "A & B"
+    text += "</function>"
+
+    result = MiniCPM5Detector().detect_and_parse(text, tools)
+    assert result.normal_text == ""
+    assert [json.loads(call.parameters) for call in result.calls] == [expected]
+
+    for split in range(1, len(text)):
+        detector = MiniCPM5Detector()
+        first = detector.parse_streaming_increment(text[:split], tools)
+        assert first.calls == [], split
+        second = detector.parse_streaming_increment(text[split:], tools)
+        assert [json.loads(call.parameters) for call in second.calls] == [expected], (
+            split
+        )
+        assert first.normal_text == second.normal_text == "", split
+
+
+@pytest.mark.parametrize("opening,closing", [("<!--", "-->"), ("<?example", "?>")])
+def test_function_boundary_markers_in_xml_section(opening, closing):
+    """A comment or processing instruction may contain literal markup."""
+    tools = make_tools_weather()
+    prefix = f'<function name="get_weather">{opening} <![CDATA[ </function>'
+    tail = f'{closing}<param name="city">Beijing</param></function>'
+    expected = [{"city": "Beijing"}]
+    result = MiniCPM5Detector().detect_and_parse(prefix + tail, tools)
+    assert [json.loads(call.parameters) for call in result.calls] == expected
+
+    detector = MiniCPM5Detector()
+    assert detector.parse_streaming_increment(prefix, tools).calls == []
+    result = detector.parse_streaming_increment(tail, tools)
+    assert [json.loads(call.parameters) for call in result.calls] == expected
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param(
+            '<param name="city"><![CDATA[A & B</param>'
+            '<param name="date">2024-06-27</param>',
+            id="unclosed-cdata",
+        ),
+        pytest.param('<param name="city"><![CDATA[printf "', id="truncated-cdata"),
+    ],
+)
+def test_unclosed_cdata_does_not_emit_tool_call(body):
+    """An apparent function end in an open CDATA section is ambiguous at EOF."""
+    tools = make_tools_weather()
+    text = f'<function name="get_weather">{body}</function>'
+    result = MiniCPM5Detector().detect_and_parse(text, tools)
+    assert result.calls == []
+    assert result.normal_text == text
+
+    detector = MiniCPM5Detector()
+    assert detector.parse_streaming_increment(text, tools).calls == []
+    assert detector.finish(tools).calls == []
+
+
+@pytest.mark.parametrize(
+    "opening,closing", [("<!--", "-->"), ("<![CDATA[", "]]>")], ids=["comment", "cdata"]
+)
+def test_fallback_ignores_parameter_markup_in_xml_section(opening, closing):
+    """Markup in a comment or CDATA cannot supply a required parameter."""
+    tools = make_tools_weather()
+    text = (
+        '<function name="get_weather">'
+        f'{opening}</function><param name="city">ignored</param>{closing}'
+        '<param name="date">A & B</param></function>'
+    )
+    result = MiniCPM5Detector().detect_and_parse(text, tools)
+    assert result.calls == []
+    assert result.normal_text == text
+    assert MiniCPM5Detector().parse_streaming_increment(text, tools).calls == []
 
 
 def test_valid_xml_preserves_arguments_wrapper_and_value_conversion():
@@ -345,9 +440,14 @@ def test_valid_xml_preserves_arguments_wrapper_and_value_conversion():
             "literal <param prefix", "literal <param prefix", id="literal-param-prefix"
         ),
         pytest.param(
-            "echo '</arguments>' '</param >' '<![CDATA[' && ls",
-            "echo '</arguments>' '</param >' '<![CDATA[' && ls",
+            "echo '</arguments>' '</param >' && ls",
+            "echo '</arguments>' '</param >' && ls",
             id="literal-markup-in-command",
+        ),
+        pytest.param(
+            'echo "<!-- </function></param> -->" x',
+            'echo "<!-- </function></param> -->" x',
+            id="literal-comment-with-end-tags",
         ),
     ],
 )
