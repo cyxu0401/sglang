@@ -6292,7 +6292,7 @@ class TestMuseSparkFunctionCallParser(CustomTestCase):
                 )
 
 
-class TestToolCallParserNames(unittest.TestCase):
+class TestToolCallParserNames(CustomTestCase):
     def test_matches_registry(self):
         # `server_args` builds the --tool-call-parser choices from this list to
         # keep the registry, and its dependencies, out of argument parsing.
@@ -6300,6 +6300,12 @@ class TestToolCallParserNames(unittest.TestCase):
             sorted(TOOL_CALL_PARSER_NAMES),
             sorted(FunctionCallParser.ToolCallParserEnum),
         )
+
+    def test_minicpm_alias_uses_same_detector(self):
+        """Keep the compatibility name on the same XML parsing path."""
+        canonical = FunctionCallParser(tools=[], tool_call_parser="minicpm5")
+        legacy = FunctionCallParser(tools=[], tool_call_parser="minicpm4_xml")
+        self.assertIs(type(legacy.detector), type(canonical.detector))
 
 
 if __name__ == "__main__":
