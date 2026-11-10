@@ -30,7 +30,6 @@ TOOL_CALL_PARSER_NAMES = [
     "ling3",
     "llama3",
     "mimo",
-    "minicpm4_xml",
     "minicpm5",
     "mistral",
     "muse",

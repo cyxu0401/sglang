@@ -101,7 +101,6 @@ class FunctionCallParser:
         "ling3": Ling3Detector,
         "llama3": Llama32Detector,
         "mimo": MiMoDetector,
-        "minicpm4_xml": MiniCPM4XmlFormatDetector,
         "minicpm5": MiniCPM4XmlFormatDetector,
         "mistral": MistralDetector,
         "muse": MuseGlimmerDetector,
